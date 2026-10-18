@@ -115,6 +115,16 @@ public class ToolStateCollector {
 	}
 
 	/**
+	 * The live update map created for the tool at the given index, for merge-boundary
+	 * validation of the patch that tool produced.
+	 * @param index the tool index (0-based, in original toolCalls order)
+	 * @return the tool's update map, or {@code null} when none exists for the index
+	 */
+	public Map<String, Object> toolUpdateMap(int index) {
+		return toolUpdatesByIndex.get(index);
+	}
+
+	/**
 	 * Merges all tool updates in original index order (0, 1, 2, ...). This ensures
 	 * deterministic results regardless of completion order.
 	 *

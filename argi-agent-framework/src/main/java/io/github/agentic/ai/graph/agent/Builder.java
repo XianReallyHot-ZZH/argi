@@ -33,6 +33,7 @@ import io.github.agentic.ai.graph.agent.interceptor.BusinessOutcomeMapperRegistr
 import io.github.agentic.ai.graph.agent.interceptor.ModelInterceptor;
 import io.github.agentic.ai.graph.agent.interceptor.StreamingModelInterceptor;
 import io.github.agentic.ai.graph.agent.interceptor.ToolInterceptor;
+import io.github.agentic.ai.graph.agent.tool.patch.ToolContextPatchPolicy;
 import io.github.agentic.ai.graph.checkpoint.BaseCheckpointSaver;
 import io.github.agentic.ai.graph.checkpoint.config.SaverConfig;
 
@@ -64,6 +65,9 @@ public abstract class Builder {
 	protected ToolRegistry toolRegistry = new ToolRegistry(List.of());
 
 	protected BusinessOutcomeMapperRegistry businessOutcomeMappers = BusinessOutcomeMapperRegistry.empty();
+
+	/** Opt-in policy gating tool context patches at the merge boundary; null disables. */
+	protected ToolContextPatchPolicy toolContextPatchPolicy;
 
 	protected boolean throwOnModelError;
 
@@ -155,6 +159,20 @@ public abstract class Builder {
 	public Builder businessOutcomeMappers(BusinessOutcomeMapperRegistry businessOutcomeMappers) {
 		this.businessOutcomeMappers = Objects.requireNonNull(businessOutcomeMappers,
 				"businessOutcomeMappers must not be null");
+		return this;
+	}
+
+	/**
+	 * Opt-in policy gating tool context patches at the tool-node merge boundary: patches
+	 * of failed calls are discarded and patches writing reserved state keys, undeclared
+	 * keys or values of the wrong type are rejected (discarded or aborting the run, as
+	 * configured). Default: no policy, preserving the historical merge behavior.
+	 * @param toolContextPatchPolicy the patch policy to enforce, or {@code null} to
+	 * disable patch admission
+	 * @return this builder
+	 */
+	public Builder toolContextPatchPolicy(ToolContextPatchPolicy toolContextPatchPolicy) {
+		this.toolContextPatchPolicy = toolContextPatchPolicy;
 		return this;
 	}
 

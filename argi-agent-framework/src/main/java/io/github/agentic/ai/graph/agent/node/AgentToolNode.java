@@ -35,6 +35,10 @@ import io.github.agentic.ai.graph.agent.interceptor.ToolInterceptor;
 import io.github.agentic.ai.graph.agent.tool.DefaultCancellationToken;
 import io.github.agentic.ai.graph.agent.tool.ToolCancelledException;
 import io.github.agentic.ai.graph.agent.tool.ToolStateCollector;
+import io.github.agentic.ai.graph.agent.tool.patch.ToolContextPatchPolicy;
+import io.github.agentic.ai.graph.agent.tool.patch.ToolContextPatchSpec;
+import io.github.agentic.ai.graph.agent.tool.patch.ToolContextPatchValidator;
+import io.github.agentic.ai.graph.agent.tool.patch.ToolContextPatchViolationException;
 import io.github.agentic.ai.graph.agent.validation.ToolArgumentValidator;
 import io.github.agentic.ai.graph.checkpoint.lease.ExecutionGuard;
 import io.github.agentic.ai.graph.checkpoint.lease.LeaseLostException;
@@ -123,6 +127,8 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 	private final BusinessOutcomeMapperRegistry businessOutcomeMappers;
 
+	private final ToolContextPatchPolicy toolContextPatchPolicy;
+
 	private final ThreadPoolExecutor neutralInvocationExecutor;
 
 	public AgentToolNode(Builder builder) {
@@ -147,6 +153,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 		this.validateToolArguments = builder.validateToolArguments;
 		this.throwOnToolError = builder.throwOnToolError;
 		this.businessOutcomeMappers = builder.businessOutcomeMappers;
+		this.toolContextPatchPolicy = builder.toolContextPatchPolicy;
 	}
 
 	public void setToolInterceptors(List<ToolInterceptor> toolInterceptors) {
@@ -262,8 +269,11 @@ public class AgentToolNode implements NodeActionWithConfig {
 			returnDirect = shouldReturnDirect(toolCall, returnDirect, config);
 			config.assertExecutionActive();
 			// Merge immediately - subsequent timeout clear() won't affect already-merged
-			// data
-			mergedUpdates.putAll(toolSpecificUpdate);
+			// data. A configured patch policy gates the merge boundary: patches of failed
+			// calls and invalid patches never reach the next turn's state.
+			if (admitsPatch(toolCall.name(), response, toolSpecificUpdate)) {
+				mergedUpdates.putAll(toolSpecificUpdate);
+			}
 		}
 		config.assertExecutionActive();
 
@@ -453,6 +463,9 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 		updatedState.put("messages", AgentChatProtocol.toolResponse(toolResponses,
 				Boolean.TRUE.equals(returnDirect) ? Map.of(FINISH_REASON_METADATA_KEY, FINISH_REASON) : Map.of()));
+		// Same merge-boundary gate as sequential mode, applied per tool index: rejected
+		// patches are discarded before mergeAll() so they cannot pollute the state.
+		discardRejectedPatches(toolCalls, orderedResponses, stateCollector);
 		updatedState.putAll(stateCollector.mergeAll());
 
 		if (enableActingLog) {
@@ -761,6 +774,58 @@ public class AgentToolNode implements NodeActionWithConfig {
 	}
 
 	/**
+	 * Applies the configured patch policy to every collected response before the parallel
+	 * merge, discarding the update maps of rejected calls. No-op without a policy.
+	 */
+	private void discardRejectedPatches(List<io.github.agentic.ai.api.chat.ToolCall> toolCalls,
+			AtomicReferenceArray<ToolCallResponse> orderedResponses, ToolStateCollector stateCollector) {
+		if (toolContextPatchPolicy == null) {
+			return;
+		}
+		for (int i = 0; i < orderedResponses.length(); i++) {
+			ToolCallResponse response = orderedResponses.get(i);
+			if (response == null) {
+				continue;
+			}
+			if (!admitsPatch(toolCalls.get(i).name(), response, stateCollector.toolUpdateMap(i))) {
+				stateCollector.discardToolUpdateMap(i);
+			}
+		}
+	}
+
+	/**
+	 * Merge-boundary admission for one tool's context patch. Without a policy every patch
+	 * is admitted (legacy behavior). With a policy, patches of failed calls are discarded
+	 * first (their stray writes are dropped, never escalated), then the patch is validated
+	 * against the reserved namespace and the tool's declared spec; a violation either
+	 * discards the whole patch or aborts the run, as configured.
+	 * @param toolName the tool whose patch is being admitted
+	 * @param response the tool call's outcome, whose error state gates the patch
+	 * @param patch the update map the tool produced, or {@code null} when none exists
+	 * @return {@code true} when the patch may be merged into the next turn's state
+	 */
+	private boolean admitsPatch(String toolName, ToolCallResponse response, Map<String, Object> patch) {
+		if (toolContextPatchPolicy == null || patch == null || patch.isEmpty()) {
+			return true;
+		}
+		if (toolContextPatchPolicy.discardPatchOnFailedResult() && response.isError()) {
+			logger.warn("Discarding context patch of failed tool call {}: the tool reported an error", toolName);
+			return false;
+		}
+		ToolContextPatchSpec spec = toolContextPatchPolicy.specFor(toolName);
+		var failure = ToolContextPatchValidator.validate(spec, toolName, patch);
+		if (failure.isPresent()) {
+			if (toolContextPatchPolicy.violationPolicy() == ToolContextPatchPolicy.ViolationPolicy.ABORT_RUN) {
+				throw new ToolContextPatchViolationException(failure.get());
+			}
+			logger.warn("Discarding context patch of tool {}: {} on key {}", toolName, failure.get().errorCode(),
+					failure.get().key());
+			return false;
+		}
+		return true;
+	}
+
+	/**
 	 * Derives the structured failure metadata for an error response from the throwable
 	 * that caused it: a {@link ToolCallResponse#FAILURE_KIND_METADATA_KEY failure kind}
 	 * and, when available, the {@link ToolCallResponse#EXCEPTION_TYPE_METADATA_KEY class
@@ -878,9 +943,23 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 		private boolean throwOnToolError;
 
+		private ToolContextPatchPolicy toolContextPatchPolicy;
+
 		/** Controls failure propagation for provider-neutral tool stages. */
 		public Builder throwOnToolError(boolean throwOnToolError) {
 			this.throwOnToolError = throwOnToolError;
+			return this;
+		}
+
+		/**
+		 * Opt-in policy gating tool context patches at the merge boundary. Default
+		 * {@code null}: every patch is merged, matching the historical behavior.
+		 * @param toolContextPatchPolicy the patch policy to enforce, or {@code null} to
+		 * disable patch admission
+		 * @return this builder
+		 */
+		public Builder toolContextPatchPolicy(ToolContextPatchPolicy toolContextPatchPolicy) {
+			this.toolContextPatchPolicy = toolContextPatchPolicy;
 			return this;
 		}
 

@@ -111,7 +111,8 @@ public class DefaultBuilder extends Builder {
 			.toolExecutionTimeout(this.toolExecutionTimeout)
 			.validateToolArguments(this.validateToolArguments)
 			.toolBindingStore(toolBindings)
-			.businessOutcomeMappers(this.businessOutcomeMappers);
+			.businessOutcomeMappers(this.businessOutcomeMappers)
+			.toolContextPatchPolicy(this.toolContextPatchPolicy);
 
 		toolBuilder.throwOnToolError(throwOnToolError);
 
