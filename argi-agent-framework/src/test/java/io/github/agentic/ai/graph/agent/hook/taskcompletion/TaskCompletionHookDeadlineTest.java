@@ -47,6 +47,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Deadline behavior of {@link TaskCompletionHook} driven through the package-private
  * {@code nanoTime} test seam.
+ *
+ * <p>This test deliberately lives next to the main class (singular {@code hook} package,
+ * unlike the public-API tests in {@code hooks.taskcompletion}) because the seam is
+ * package-private — the same layout as {@code EffectAwareToolRetryInterceptorTest} in
+ * the tool-retry package.</p>
  */
 class TaskCompletionHookDeadlineTest {
 

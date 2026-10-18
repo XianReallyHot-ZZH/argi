@@ -285,7 +285,10 @@ public class TaskCompletionHook extends ModelHook {
 
 	private String decisionFingerprint(ChatMessage message) {
 		if (!message.hasToolCalls()) {
-			return "final:" + message.text();
+			// Defensive normalization: text() joins content parts and never returns null
+			// today, but a null must never collide with an answer that literally reads
+			// "null" — identical textless turns still compare as identical by design.
+			return "final:" + Objects.requireNonNullElse(message.text(), "");
 		}
 		return "tools:" + message.toolCalls()
 			.stream()

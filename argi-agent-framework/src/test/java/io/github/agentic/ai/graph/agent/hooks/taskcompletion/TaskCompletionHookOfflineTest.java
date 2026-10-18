@@ -206,6 +206,34 @@ class TaskCompletionHookOfflineTest {
 	}
 
 	@Test
+	void textlessAssistantAnswersStillCountAsRepeatsWhenIdentical() throws Exception {
+		ScriptedClient client = new ScriptedClient(textless(), textless());
+		ReactAgent agent = agent(client, TaskCompletionHook.builder().maxConsecutiveRepeats(2).build());
+
+		Optional<OverAllState> result = agent.invoke(Map.of("messages", List.of(ChatMessage.user("do the work")),
+				"todos", todos("pending:run tests")));
+
+		assertTrue(result.isPresent());
+		assertEquals(2, client.requests.size());
+		terminal(result.get(), STOP, "REPEATED_DECISION");
+	}
+
+	@Test
+	void textlessAnswerDoesNotCollideWithALiteralNullAnswer() throws Exception {
+		ScriptedClient client = new ScriptedClient(textless(), text("null"), text("final try"));
+		ReactAgent agent = agent(client, TaskCompletionHook.builder().maxConsecutiveRepeats(2).build());
+
+		Optional<OverAllState> result = agent.invoke(Map.of("messages", List.of(ChatMessage.user("do the work")),
+				"todos", todos("pending:run tests")));
+
+		assertTrue(result.isPresent());
+		// A literal "null" answer must not be fingerprint-equal to a textless turn, so
+		// the repeat bound never fires and the run reaches the exhaustion terminal.
+		assertEquals(3, client.requests.size());
+		terminal(result.get(), NEED_INPUT, "UNFINISHED_REQUIRED_TASKS");
+	}
+
+	@Test
 	void errorExitBehaviorThrowsTaskCompletionExceededExceptionAfterTerminalState() throws Exception {
 		ScriptedClient client = new ScriptedClient(text("answer one"), text("answer two"), text("answer three"));
 		ReactAgent agent = agent(client, TaskCompletionHook.builder()
@@ -343,6 +371,11 @@ class TaskCompletionHookOfflineTest {
 
 	private static ChatResponse text(String content) {
 		return response(content, List.of());
+	}
+
+	/** An assistant turn without any text content (text() renders as the empty string). */
+	private static ChatResponse textless() {
+		return response(null, List.of());
 	}
 
 	private static ChatResponse toolCall(String id, String name, String arguments) {
