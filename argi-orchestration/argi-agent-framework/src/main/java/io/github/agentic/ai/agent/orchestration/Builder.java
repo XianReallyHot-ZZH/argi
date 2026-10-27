@@ -29,7 +29,7 @@ import io.github.agentic.ai.workflow.graph.CompileConfig;
 import io.github.agentic.ai.workflow.graph.KeyStrategy;
 import io.github.agentic.ai.agent.orchestration.hook.Hook;
 import io.github.agentic.ai.agent.interceptor.Interceptor;
-import io.github.agentic.ai.agent.interceptor.BusinessOutcomeMapperRegistry;
+import io.github.agentic.ai.agent.outcome.BusinessOutcomeMapperRegistry;
 import io.github.agentic.ai.agent.interceptor.ModelInterceptor;
 import io.github.agentic.ai.agent.orchestration.interceptor.StreamingModelInterceptor;
 import io.github.agentic.ai.agent.orchestration.interceptor.ToolInterceptor;
@@ -128,6 +128,8 @@ public abstract class Builder {
 	protected Duration toolExecutionTimeout = Duration.ofMinutes(5);
 
 	protected boolean validateToolArguments = false;
+
+	protected boolean strictToolState = false;
 
 	public Builder name(String name) {
 		this.name = name;
@@ -305,6 +307,19 @@ public abstract class Builder {
 	 */
 	public Builder validateToolArguments(boolean validate) {
 		this.validateToolArguments = validate;
+		return this;
+	}
+
+	/**
+	 * Opt-in strict tool-state semantics for the agent's tool node: read-only state
+	 * views for tools, mandatory failure-discard of patches, KeyStrategy-honoring
+	 * sequential merges and strategy-explicit parallel merges. Default
+	 * {@code false}: legacy behavior.
+	 * @param strict true to enable strict tool-state semantics
+	 * @return this builder instance
+	 */
+	public Builder strictToolState(boolean strict) {
+		this.strictToolState = strict;
 		return this;
 	}
 
