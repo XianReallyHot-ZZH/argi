@@ -29,8 +29,8 @@ import java.util.Map;
  * Tools historically received the shared state (or a shallow snapshot of it), so a tool
  * could mutate a shared {@code List} or {@code Map} value — at any nesting depth — and
  * bypass the patch channel. Strict mode replaces that hazard with a structural
- * guarantee: every {@code List} and {@code Map} reachable from the view rejects
- * mutation, so state writes can escape only through the tool's patch.
+ * guarantee: every {@code List} and {@code Map} reached through {@code List}/{@code Map}
+ * nesting rejects mutation, so state writes can escape only through the tool's patch.
  * </p>
  *
  * <p>
@@ -49,8 +49,9 @@ public final class StateIsolation {
 	}
 
 	/**
-	 * Returns an unmodifiable view of the given state whose reachable {@code List} and
-	 * {@code Map} values — nested to any depth — are unmodifiable as well.
+	 * Returns an unmodifiable view of the given state whose {@code List} and {@code Map}
+	 * values — nested through further Lists and Maps to any depth — are unmodifiable as
+	 * well.
 	 * @param state the state a tool may read, or {@code null}
 	 * @return an unmodifiable, recursively wrapped read view; empty when the input is
 	 * null or empty

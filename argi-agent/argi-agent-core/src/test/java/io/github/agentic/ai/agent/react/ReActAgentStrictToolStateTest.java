@@ -193,17 +193,7 @@ class ReActAgentStrictToolStateTest {
 	@Test
 	void strictRejectsNestedMapMutationThroughToolContext() throws Exception {
 		var mutationFailure = new AtomicReference<Throwable>();
-		Tool mutator = tool("mutate", (call, context) -> {
-			@SuppressWarnings("unchecked")
-			List<Map<String, Object>> records = (List<Map<String, Object>>) context.attributes().get("records");
-			try {
-				records.get(0).put("approved", true);
-			}
-			catch (UnsupportedOperationException rejection) {
-				mutationFailure.set(rejection);
-			}
-			return CompletableFuture.completedFuture(ToolResult.text("done"));
-		});
+		Tool mutator = nestedMutator(ToolResult.text("done"), mutationFailure);
 		var outcome = invoke(strictAgent(mutator, "mutate"), recordsRequest());
 		assertInstanceOf(UnsupportedOperationException.class, mutationFailure.get());
 		assertThatRecordRemainsUnapproved(outcome);
@@ -211,17 +201,7 @@ class ReActAgentStrictToolStateTest {
 
 	@Test
 	void strictLeavesNestedStateUnchangedWhenToolFailsAfterNestedMutationAttempt() throws Exception {
-		Tool failing = tool("mutate", (call, context) -> {
-			@SuppressWarnings("unchecked")
-			List<Map<String, Object>> records = (List<Map<String, Object>>) context.attributes().get("records");
-			try {
-				records.get(0).put("approved", true);
-			}
-			catch (UnsupportedOperationException ignored) {
-				// The rejection itself is the guard; the tool still fails afterwards.
-			}
-			return CompletableFuture.completedFuture(ToolResult.error("boom"));
-		});
+		Tool failing = nestedMutator(ToolResult.error("boom"), new AtomicReference<>());
 		var outcome = invoke(strictAgent(failing, "mutate"), recordsRequest());
 		assertThatRecordRemainsUnapproved(outcome);
 	}
@@ -256,6 +236,25 @@ class ReActAgentStrictToolStateTest {
 		Map<String, Object> record = new java.util.HashMap<>(Map.of("approved", false));
 		return new AgentRequest(List.of(ChatMessage.user("hello")),
 				Map.of("records", new ArrayList<>(List.of(record))), null);
+	}
+
+	/**
+	 * A tool that reaches the nested {@code records} maps through the tool-visible state
+	 * and flips {@code approved} — the depth the one-level view missed. The rejection is
+	 * captured so the configured result still completes the call.
+	 */
+	private static Tool nestedMutator(ToolResult result, AtomicReference<Throwable> rejection) {
+		return tool("mutate", (call, context) -> {
+			@SuppressWarnings("unchecked")
+			List<Map<String, Object>> records = (List<Map<String, Object>>) context.attributes().get("records");
+			try {
+				records.get(0).put("approved", true);
+			}
+			catch (UnsupportedOperationException failure) {
+				rejection.set(failure);
+			}
+			return CompletableFuture.completedFuture(result);
+		});
 	}
 
 	@SuppressWarnings("unchecked")
