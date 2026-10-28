@@ -596,8 +596,7 @@ public final class ReActAgent implements Agent {
 				// original stays in history, and stream consumers see it through the
 				// complete-message event before the finished snapshot.
 				ChatMessage delivered = result.message();
-				if (delivered != null && !delivered.text().equals(terminal.text())
-						&& !messages.isEmpty() && messages.get(messages.size() - 1) == terminal) {
+				if (delivered != null && !Objects.equals(delivered.text(), terminal.text())) {
 					messages.add(delivered);
 					emit(new AgentEvent.Message("model-repair", delivered));
 				}

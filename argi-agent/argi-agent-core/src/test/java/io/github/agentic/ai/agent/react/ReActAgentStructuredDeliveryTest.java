@@ -98,6 +98,23 @@ class ReActAgentStructuredDeliveryTest {
 	}
 
 	@Test
+	void noRepairClientKeepsValidationFailedState() throws Exception {
+		ReActAgent agent = ReActAgent.builder(new ScriptedClient("not-json"))
+			.outputSchema(SCHEMA)
+			.outputFinalizer(new StructuredOutputFinalizer())
+			.build();
+
+		ExecutionException failure = assertThrows(ExecutionException.class,
+				() -> agent.invoke(request(), context()).get(3, TimeUnit.SECONDS));
+
+		assertTrue(failure.getCause() instanceof AgentExecutionException);
+		AgentExecutionException delivery = (AgentExecutionException) failure.getCause();
+		assertEquals(AgentResult.Status.VALIDATION_FAILED, delivery.result().status());
+		assertTrue(delivery.result().issues().stream().anyMatch(
+				issue -> AgentResult.ERROR_CODE_INVALID_JSON.equals(issue.errorCode())));
+	}
+
+	@Test
 	void repairStillInvalidKeepsFailureStateDistinct() throws Exception {
 		ReActAgent agent = ReActAgent.builder(new ScriptedClient("not-json"))
 			.outputSchema(SCHEMA)
