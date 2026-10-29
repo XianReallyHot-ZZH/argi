@@ -24,6 +24,9 @@ import io.github.agentic.ai.api.chat.ChatClient;
 import io.github.agentic.ai.api.chat.ChatResponse;
 
 import io.github.agentic.ai.agent.AgentResult;
+import io.github.agentic.ai.runtime.execution.ExecutionControl;
+import io.github.agentic.ai.runtime.execution.ExecutionGuard;
+import io.github.agentic.ai.runtime.execution.TrustedExecutionContext;
 import io.github.agentic.ai.workflow.graph.CompileConfig;
 import io.github.agentic.ai.workflow.graph.CompiledGraph;
 import io.github.agentic.ai.workflow.graph.GraphResponse;
@@ -85,6 +88,7 @@ import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.SignalType;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -95,6 +99,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -441,11 +446,11 @@ public class ReactAgent extends BaseAgent {
 	}
 
 	private Flux<AgentResult> doStreamResult(Object message, RunnableConfig config) {
-		return doStream(buildMessageInput(message), config).transform(this::finalizeStream);
+		return doStream(buildMessageInput(message), config).transform(outputs -> finalizeStream(outputs, config));
 	}
 
 	private Flux<AgentResult> doStreamResult(Map<String, Object> inputs, RunnableConfig config) {
-		return doStream(normalizeMessageInput(inputs), config).transform(this::finalizeStream);
+		return doStream(normalizeMessageInput(inputs), config).transform(outputs -> finalizeStream(outputs, config));
 	}
 
 	/**
@@ -456,7 +461,7 @@ public class ReactAgent extends BaseAgent {
 	 * Aggregation is local to each subscription. Re-subscribing still subscribes to the
 	 * underlying execution again; it does not cache results or make side effects idempotent.
 	 */
-	private Flux<AgentResult> finalizeStream(Flux<NodeOutput> outputs) {
+	private Flux<AgentResult> finalizeStream(Flux<NodeOutput> outputs, RunnableConfig config) {
 		return Flux.defer(() -> {
 			AtomicReference<ChatResponse> finalResponse = new AtomicReference<>();
 			return outputs.concatMap(output -> {
@@ -485,14 +490,14 @@ public class ReactAgent extends BaseAgent {
 				if (terminal == null) {
 					return Flux.just(AgentResult.interrupted(response.usage()));
 				}
-				return Flux.just(deliver(terminal, response.usage()));
+				return Flux.just(deliver(terminal, response.usage(), config));
 			}));
 		});
 	}
 
 	private AgentResult doResultInvoke(Object message, RunnableConfig config) {
 		try {
-			return finalizeResult(doInvokeAndGetOutput(buildMessageInput(message), config));
+			return finalizeResult(doInvokeAndGetOutput(buildMessageInput(message), config), config);
 		}
 		catch (RuntimeException ex) {
 			return AgentResult.error(null, Usage.unknown(),
@@ -503,7 +508,7 @@ public class ReactAgent extends BaseAgent {
 
 	private AgentResult doResultInvoke(Map<String, Object> inputs, RunnableConfig config) {
 		try {
-			return finalizeResult(doInvokeAndGetOutput(normalizeMessageInput(inputs), config));
+			return finalizeResult(doInvokeAndGetOutput(normalizeMessageInput(inputs), config), config);
 		}
 		catch (RuntimeException ex) {
 			return AgentResult.error(null, Usage.unknown(),
@@ -512,7 +517,7 @@ public class ReactAgent extends BaseAgent {
 		}
 	}
 
-	private AgentResult finalizeResult(Optional<NodeOutput> output) {
+	private AgentResult finalizeResult(Optional<NodeOutput> output, RunnableConfig config) {
 		// The runner strips the reserved usage key from the state and attaches it to the
 		// NodeOutput instead, so the usage comes from the final output record.
 		Usage usage = output.map(NodeOutput::tokenUsage).orElseGet(Usage::unknown);
@@ -525,11 +530,17 @@ public class ReactAgent extends BaseAgent {
 			// interruption): report it as unfinished, never as completed.
 			return AgentResult.interrupted(usage);
 		}
-		return deliver(terminal, usage);
+		return deliver(terminal, usage, config);
 	}
 
-	/** Maps a terminal message onto the delivery boundary shared by call and stream paths. */
-	private AgentResult deliver(ChatMessage terminal, Usage usage) {
+	/**
+	 * Maps a terminal message onto the delivery boundary shared by call and stream paths.
+	 * The run's execution boundaries travel with the delivery: the config's own control
+	 * passes through unchanged, a trusted deadline without one is bridged onto a control
+	 * owned by this delivery, and a stop observed during the final repair stays a stop —
+	 * it must neither publish a completed output nor degrade to a validation failure.
+	 */
+	private AgentResult deliver(ChatMessage terminal, Usage usage, RunnableConfig config) {
 		if (Boolean.TRUE.equals(terminal.metadata().get(AgentLlmNode.MODEL_FAILURE_METADATA_KEY))) {
 			// throwOnModelError=false surfaces model failures as an assistant message
 			// that only the model node can mark.
@@ -537,7 +548,32 @@ public class ReactAgent extends BaseAgent {
 					List.of(new AgentResult.OutputValidationIssue(AgentResult.ERROR_CODE_MODEL_FAILED, "",
 							terminal.text())));
 		}
-		return finalizer().finalizeOutput(terminal, outputSchema, usage);
+		TrustedExecutionContext trusted = config == null ? null : config.trustedExecutionContext().orElse(null);
+		ExecutionGuard guard = config == null ? null : config.executionGuard().orElse(null);
+		if (trusted != null && !(guard instanceof ExecutionControl)) {
+			// The remaining deadline and the ownership boundary combine into a control
+			// owned by this delivery; the neutral finalizer stays free of graph types.
+			try (ExecutionControl owned = new ExecutionControl(trusted, Clock.systemUTC(), guard)) {
+				return finalizeUnderGuard(terminal, usage, owned);
+			}
+		}
+		if (guard == null && trusted == null) {
+			// No execution boundary is attached to the run: keep the uncontrolled
+			// legacy delivery.
+			return finalizer().finalizeOutput(terminal, outputSchema, usage);
+		}
+		return finalizeUnderGuard(terminal, usage, guard);
+	}
+
+	private AgentResult finalizeUnderGuard(ChatMessage terminal, Usage usage, ExecutionGuard guard) {
+		try {
+			return finalizer().finalizeOutput(terminal, outputSchema, usage, guard);
+		}
+		catch (CancellationException stopped) {
+			// A cancelled, expired or lost-ownership run must not publish a late output:
+			// the stop stays a stop instead of degrading to a validation failure.
+			return AgentResult.interrupted(usage);
+		}
 	}
 
 	/**
