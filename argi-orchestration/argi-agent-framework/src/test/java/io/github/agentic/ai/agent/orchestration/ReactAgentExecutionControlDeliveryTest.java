@@ -24,6 +24,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
@@ -37,6 +38,7 @@ import io.github.agentic.ai.api.chat.FinishReason;
 import io.github.agentic.ai.api.chat.Usage;
 import io.github.agentic.ai.agent.AgentResult;
 import io.github.agentic.ai.runtime.execution.ExecutionControl;
+import io.github.agentic.ai.runtime.execution.ExecutionGuard;
 import io.github.agentic.ai.runtime.execution.PrincipalReference;
 import io.github.agentic.ai.runtime.execution.TenantReference;
 import io.github.agentic.ai.runtime.execution.TrustedExecutionContext;
@@ -110,7 +112,7 @@ class ReactAgentExecutionControlDeliveryTest {
 	@DisplayName("a trusted deadline without a guard stops a never-returning graph repair")
 	void trustedDeadlineStopsANeverReturningGraphRepair() {
 		final ControllableClient client = ControllableClient.blockingMainModel("plain prose answer");
-		final TrustedExecutionContext trusted = trustedContext(Instant.now().plusMillis(1500));
+		final TrustedExecutionContext trusted = trustedContext(Instant.now().plusMillis(3000));
 		final RunnableConfig config = RunnableConfig.builder().trustedExecutionContext(trusted).build();
 		final ReactAgent agent = agent(client, SCHEMA);
 
@@ -158,6 +160,59 @@ class ReactAgentExecutionControlDeliveryTest {
 	}
 
 	@Test
+	@Timeout(15)
+	@DisplayName("a lease-style guard lost during the graph repair delivers INTERRUPTED, not a marked repair failure")
+	void leaseStyleGuardLostDuringGraphRepairInterruptsDelivery() throws Exception {
+		final LeaseStyleGuard guard = new LeaseStyleGuard();
+		final ControllableClient client = ControllableClient.blockingMainModel("plain prose answer");
+		final RunnableConfig config = RunnableConfig.builder().executionGuard(guard).build();
+		final ReactAgent agent = agent(client, SCHEMA);
+
+		final Thread loser = new Thread(() -> {
+			try {
+				client.awaitRepairStarted(5, TimeUnit.SECONDS);
+				guard.lose();
+				// A lease-fenced adapter call fails with the lease's own exception type.
+				client.repairPending.completeExceptionally(new IllegalStateException("lease fenced the call"));
+			}
+			catch (InterruptedException ignored) {
+				Thread.currentThread().interrupt();
+			}
+		});
+		loser.start();
+		try {
+			final AgentResult result = agent.callResult("give me the status", config);
+
+			assertThat(result.status()).isEqualTo(AgentResult.Status.INTERRUPTED);
+			// The stop must not be folded into a marked repair or validation failure.
+			assertThat(result.issues()).isEmpty();
+			assertThat(result.message()).isNull();
+			assertThat(client.modelCalls.get()).isEqualTo(1);
+			assertThat(client.repairCalls.get()).isEqualTo(1);
+		}
+		finally {
+			loser.join(TimeUnit.SECONDS.toMillis(5));
+		}
+	}
+
+	@Test
+	@Timeout(15)
+	@DisplayName("an expired trusted deadline delivers INTERRUPTED even when the terminal output is schema-valid")
+	void expiredDeadlineStopsDeliveryOfAValidOutput() {
+		final ControllableClient client = ControllableClient.blockingMainModel("{\"status\":\"ok\"}");
+		final TrustedExecutionContext trusted = trustedContext(Instant.now().minusSeconds(1));
+		final RunnableConfig config = RunnableConfig.builder().trustedExecutionContext(trusted).build();
+		final ReactAgent agent = agent(client, SCHEMA);
+
+		final AgentResult result = agent.callResult("give me the status", config);
+
+		assertThat(result.status()).isEqualTo(AgentResult.Status.INTERRUPTED);
+		assertThat(result.issues()).isEmpty();
+		assertThat(client.modelCalls.get()).isEqualTo(1);
+		assertThat(client.repairCalls.get()).isZero();
+	}
+
+	@Test
 	@DisplayName("without a config the bounded repair keeps completing the delivery")
 	void legacyDeliveryWithoutConfigStillRepairs() {
 		final ControllableClient client = ControllableClient.blockingMainModel("plain prose answer");
@@ -177,6 +232,34 @@ class ReactAgentExecutionControlDeliveryTest {
 			.chatClient(client)
 			.outputSchema(outputSchema)
 			.build();
+	}
+
+	/**
+	 * Mirrors a checkpoint-lease guard whose stop signal is a plain RuntimeException,
+	 * not a cancellation: the framework's own lease scope throws LeaseLostException.
+	 */
+	private static final class LeaseStyleGuard implements ExecutionGuard {
+
+		private final AtomicBoolean lost = new AtomicBoolean();
+
+		void lose() {
+			this.lost.set(true);
+		}
+
+		@Override
+		public void assertActive() {
+			if (this.lost.get()) {
+				throw new IllegalStateException("lease lost");
+			}
+		}
+
+		@Override
+		public AutoCloseable onLoss(Runnable cancellation) {
+			// The lease scope in this test reports loss only through assertActive.
+			return () -> {
+			};
+		}
+
 	}
 
 	private static ExecutionControl activeControl() {

@@ -81,12 +81,12 @@ import tools.jackson.databind.json.JsonMapper;
  * Passing the run's {@link ExecutionGuard} makes the repair re-ask execution-aware:
  * a guard that is already stopped (cancelled, past its deadline, ownership lost)
  * skips the re-ask and propagates the stop instead of returning a validation failure,
- * and a stop raised while the re-ask is in flight — including a deadline that expires
- * while the response is still pending — actively cancels that call and propagates the
- * stop reason instead of waiting on a request that may never return. A deadline that
- * expires after the response returned still stops the delivery before publishing it.
- * Without a guard, a cancelled or failing repair client degrades to the marked
- * repair failure instead.
+ * and a stop raised while the re-ask is in flight cancels that call and propagates
+ * the stop. A deadline carried by the guard is enforced while the response is still
+ * pending — a request that never returns is cancelled once the deadline expires —
+ * and a deadline that expires after the response returned still stops the delivery
+ * before publishing it. Without a guard, a cancelled or failing repair client
+ * degrades to the marked repair failure instead.
  * </p>
  */
 public final class StructuredOutputFinalizer {
@@ -141,12 +141,13 @@ public final class StructuredOutputFinalizer {
 	 * the run's execution guard. The guard governs the optional repair re-ask: a guard
 	 * that is already stopped (cancelled, past its deadline, ownership lost) skips the
 	 * re-ask and propagates the stop instead of returning a validation failure, and a
-	 * stop raised while the re-ask is in flight — including a deadline that expires
-	 * while the response is still pending — actively cancels that call and propagates
-	 * the stop reason instead of waiting on a request that may never return. A deadline
-	 * that expires after the response returned still stops the delivery before
-	 * publishing it. Validation failures themselves are never thrown. Without a guard,
-	 * a cancelled or failing repair client degrades to a marked repair failure instead.
+	 * stop raised while the re-ask is in flight cancels that call and propagates the
+	 * stop. A deadline carried by the guard is enforced while the response is still
+	 * pending — a request that never returns is cancelled once the deadline expires —
+	 * and a deadline that expires after the response returned still stops the delivery
+	 * before publishing it. Validation failures themselves are never thrown. Without a
+	 * guard, a cancelled or failing repair client degrades to a marked repair failure
+	 * instead.
 	 * @param terminal the terminal assistant message; must not be {@code null}
 	 * @param outputSchema the configured JSON Schema for the output, or {@code null} or
 	 * blank when the run has none
@@ -266,6 +267,13 @@ public final class StructuredOutputFinalizer {
 			throw cancelled;
 		}
 		catch (RuntimeException ex) {
+			if (control != null) {
+				// A stop-shaped failure (a guard whose assertActive throws a plain
+				// RuntimeException, such as a lost checkpoint lease) must propagate as
+				// that stop instead of degrading to a marked repair failure; an active
+				// guard confirms the failure was the client's own.
+				control.assertActive();
+			}
 			return null;
 		}
 	}
@@ -273,10 +281,12 @@ public final class StructuredOutputFinalizer {
 	/**
 	 * Performs the repair re-ask bound to the run's guard: a stop raised while the call
 	 * is in flight cancels the pending call, and the cancellation observed while waiting
-	 * is translated back into the guard's stop reason by the caller. The wait itself is
-	 * sliced so the synchronous deadline boundary is enforced while the response is
-	 * still pending: a request that never returns is cancelled once the deadline
-	 * expires, instead of blocking the delivery until an external timeout.
+	 * is translated back into the guard's stop by the caller. When the guard carries a
+	 * deadline the wait is sliced so the synchronous deadline boundary is enforced while
+	 * the response is still pending — a request that never returns is cancelled once the
+	 * deadline expires instead of blocking the delivery. A guard without a deadline is
+	 * waited on plainly: every stop path fires the onLoss registration synchronously,
+	 * and slicing would only add idle wakeups.
 	 */
 	private ChatResponse callUnderControl(ChatRequest request, ExecutionGuard control) {
 		CompletableFuture<ChatResponse> pending = this.repairClient.call(request).toCompletableFuture();
@@ -287,6 +297,9 @@ public final class StructuredOutputFinalizer {
 			}
 		});
 		try (AutoCloseable ignored = control.onLoss(() -> pending.cancel(true))) {
+			if (control.deadline().isEmpty()) {
+				return pending.get();
+			}
 			while (true) {
 				try {
 					return pending.get(DEADLINE_POLL_MILLIS, TimeUnit.MILLISECONDS);

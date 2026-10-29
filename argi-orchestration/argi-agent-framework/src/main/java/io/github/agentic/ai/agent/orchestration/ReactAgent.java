@@ -23,6 +23,7 @@ import io.github.agentic.ai.api.chat.Usage;
 import io.github.agentic.ai.api.chat.ChatClient;
 import io.github.agentic.ai.api.chat.ChatResponse;
 
+import io.github.agentic.ai.agent.AgentExecutionContext;
 import io.github.agentic.ai.agent.AgentResult;
 import io.github.agentic.ai.runtime.execution.ExecutionControl;
 import io.github.agentic.ai.runtime.execution.ExecutionGuard;
@@ -536,9 +537,10 @@ public class ReactAgent extends BaseAgent {
 	/**
 	 * Maps a terminal message onto the delivery boundary shared by call and stream paths.
 	 * The run's execution boundaries travel with the delivery: the config's own control
-	 * passes through unchanged, a trusted deadline without one is bridged onto a control
-	 * owned by this delivery, and a stop observed during the final repair stays a stop —
-	 * it must neither publish a completed output nor degrade to a validation failure.
+	 * passes through unchanged, a trusted deadline without one is bridged onto the
+	 * canonical invocation scope owned by this delivery, and a stop observed before or
+	 * during the final repair stays a stop — it must neither publish a completed output
+	 * nor degrade to a validation failure or an execution error.
 	 */
 	private AgentResult deliver(ChatMessage terminal, Usage usage, RunnableConfig config) {
 		if (Boolean.TRUE.equals(terminal.metadata().get(AgentLlmNode.MODEL_FAILURE_METADATA_KEY))) {
@@ -551,28 +553,56 @@ public class ReactAgent extends BaseAgent {
 		TrustedExecutionContext trusted = config == null ? null : config.trustedExecutionContext().orElse(null);
 		ExecutionGuard guard = config == null ? null : config.executionGuard().orElse(null);
 		if (trusted != null && !(guard instanceof ExecutionControl)) {
-			// The remaining deadline and the ownership boundary combine into a control
-			// owned by this delivery; the neutral finalizer stays free of graph types.
-			try (ExecutionControl owned = new ExecutionControl(trusted, Clock.systemUTC(), guard)) {
-				return finalizeUnderGuard(terminal, usage, owned);
+			// The remaining deadline and the ownership boundary combine into the
+			// canonical invocation scope owned by this delivery; the neutral finalizer
+			// stays free of graph types.
+			try (AgentExecutionContext owned = new AgentExecutionContext(trusted, Clock.systemUTC(), guard)) {
+				return finalizeUnderGuard(terminal, usage, owned.control());
 			}
-		}
-		if (guard == null && trusted == null) {
-			// No execution boundary is attached to the run: keep the uncontrolled
-			// legacy delivery.
-			return finalizer().finalizeOutput(terminal, outputSchema, usage);
 		}
 		return finalizeUnderGuard(terminal, usage, guard);
 	}
 
+	/**
+	 * Runs the final delivery under the run's guard, or uncontrolled when the run
+	 * carries none. A stop observed at the boundary — including a guard whose
+	 * assertActive throws a plain RuntimeException, such as a lost checkpoint lease —
+	 * delivers an interrupted run; any other failure keeps its pre-existing
+	 * classification.
+	 */
 	private AgentResult finalizeUnderGuard(ChatMessage terminal, Usage usage, ExecutionGuard guard) {
+		if (runStopped(guard)) {
+			// A cancelled, expired or lost-ownership run must not publish a late
+			// output, not even a schema-valid one.
+			return AgentResult.interrupted(usage);
+		}
 		try {
 			return finalizer().finalizeOutput(terminal, outputSchema, usage, guard);
 		}
 		catch (CancellationException stopped) {
-			// A cancelled, expired or lost-ownership run must not publish a late output:
-			// the stop stays a stop instead of degrading to a validation failure.
 			return AgentResult.interrupted(usage);
+		}
+		catch (RuntimeException failure) {
+			if (runStopped(guard)) {
+				// The failure was the guard's own stop signal: keep the stop semantics
+				// instead of degrading them to a marked repair or execution failure.
+				return AgentResult.interrupted(usage);
+			}
+			throw failure;
+		}
+	}
+
+	/** A guard that fails its liveness assertion marks the run as stopped. */
+	private static boolean runStopped(ExecutionGuard guard) {
+		if (guard == null) {
+			return false;
+		}
+		try {
+			guard.assertActive();
+			return false;
+		}
+		catch (RuntimeException stopped) {
+			return true;
 		}
 	}
 

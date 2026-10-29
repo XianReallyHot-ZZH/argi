@@ -180,7 +180,7 @@ class StructuredOutputFinalizerExecutionControlTest {
 	void neverReturningRepairRequestIsCancelledAtTheDeadline() {
 		final CompletableFuture<ChatResponse> pending = new CompletableFuture<>();
 		final ControlledClient client = new ControlledClient(request -> pending);
-		final ExecutionControl control = new ExecutionControl(trustedContext(Instant.now().plusMillis(250)),
+		final ExecutionControl control = new ExecutionControl(trustedContext(Instant.now().plusMillis(500)),
 				Clock.systemUTC());
 		final StructuredOutputFinalizer repairing = new StructuredOutputFinalizer(client);
 
